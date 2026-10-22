@@ -1,0 +1,105 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_gpu_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_probe();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,74 @@
++/*
++ * SWEET: opt-in, read-only GPU clock/power snapshot after ABL handoff.
++ *
++ * Register facts: MiCode Xiaomi_Kernel_OpenSource sweet-r-oss,
++ * drivers/clk/qcom/{gcc,gpucc}-sdmmagpie.c; GDSC addresses and GPUCC
++ * window are also present in this device's verified stock boot FDT.
++ *
++ * This is a prerequisite probe, not an accelerator. It never enables a
++ * clock, powers a domain, starts firmware, maps the GPU/GMU/SMMU, or submits
++ * a command. In particular, a powered GX status is not proof of rendering.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <libkern/OSAtomic.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_gpu_probe(void);
++
++#define GPU_GCC_PA          0x00100000
++#define GPU_GCC_SIZE        0x00090000
++#define GPUCC_PA            0x05090000
++#define GPUCC_SIZE          0x00009000
++#define GCC_GPU_CFG_AHB     0x71004
++#define CBCR_ENABLE        (1u << 0)
++#define CBCR_CLK_OFF       (1u << 31)
++
++static uint32_t
++gpu_probe_rd(vm_offset_t base, uint32_t off)
++{
++    uint32_t value = *(volatile uint32_t *)(base + off);
++    OSMemoryBarrier();
++    return value;
++}
++
++void
++sweet_gpu_probe(void)
++{
++    int mode = 0;
++    PE_parse_boot_argn("sweetgpuprobe", &mode, sizeof(mode));
++    if (mode != 1) {
++        return;
++    }
++
++    vm_offset_t gcc = ml_io_map(GPU_GCC_PA, GPU_GCC_SIZE);
++    if (gcc == 0) {
++        printf("SWEET GPU: GCC map failed\n");
++        return;
++    }
++    uint32_t cfg = gpu_probe_rd(gcc, GCC_GPU_CFG_AHB);
++    printf("SWEET GPU: read-only snapshot; GCC cfg-ahb 0x%08x memnoc 0x%08x snoc-dvm 0x%08x\n",
++        cfg, gpu_probe_rd(gcc, 0x7100c), gpu_probe_rd(gcc, 0x71018));
++
++    /* Reject both a stopped clock and a disabled/all-zero CBCR. Never
++     * inspect GPUCC over an unproven configuration-bus clock path. */
++    if ((cfg & (CBCR_ENABLE | CBCR_CLK_OFF)) != CBCR_ENABLE) {
++        printf("SWEET GPU: configuration clock unavailable; GPUCC not read\n");
++        return;
++    }
++    vm_offset_t cc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
++    if (cc == 0) {
++        printf("SWEET GPU: GPUCC map failed\n");
++        return;
++    }
++    printf("SWEET GPU: CX_GDSCR 0x%08x GX_GDSCR 0x%08x\n",
++        gpu_probe_rd(cc, 0x106c), gpu_probe_rd(cc, 0x100c));
++    printf("SWEET GPU: GPUCC ahb 0x%08x cx-gfx3d 0x%08x cx-gfx3d-slv 0x%08x cx-gmu 0x%08x\n",
++        gpu_probe_rd(cc, 0x1078), gpu_probe_rd(cc, 0x10a4),
++        gpu_probe_rd(cc, 0x10a8), gpu_probe_rd(cc, 0x1098));
++    printf("SWEET GPU: GPUCC gx-gfx3d 0x%08x gx-gmu 0x%08x; execution not started\n",
++        gpu_probe_rd(cc, 0x1054), gpu_probe_rd(cc, 0x1064));
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
