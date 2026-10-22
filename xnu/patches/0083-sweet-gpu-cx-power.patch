@@ -1,0 +1,460 @@
+diff --git a/bsd/dev/sweet_rpmh_arc.c b/bsd/dev/sweet_rpmh_arc.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_rpmh_arc.c
+@@ -0,0 +1,54 @@
++/*
++ * SWEET: translate RPMh ARC command-DB level maps into safe selectors.
++ * The raw command DB contains little-endian u16 levels; ARC TCS payloads
++ * carry an index, not the consumer voltage level.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/errno.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++int
++sweet_rpmh_arc_choose_level(const uint16_t *raw, unsigned count, uint32_t requested,
++    uint32_t *selector)
++{
++	if (!raw || !selector || count == 0 || count > 16 || requested == 0) {
++		return EINVAL;
++	}
++
++	unsigned live = count;
++	for (unsigned i = 1; i < count; ++i) {
++		if (raw[i] == 0) {
++			for (unsigned j = i; j < count; ++j) {
++				if (raw[j] != 0) {
++					return EINVAL;
++				}
++			}
++			live = i;
++			break;
++		}
++		if (raw[i] <= raw[i - 1]) {
++			return EINVAL;
++		}
++	}
++
++	bool found = false;
++	uint32_t best = 0;
++	unsigned best_index = 0;
++	for (unsigned i = 0; i < live; ++i) {
++		/* Xiaomi's regulator driver adds LEVEL_OFFSET (1) to each u16. */
++		uint32_t level = (uint32_t)raw[i] + 1u;
++		if (level >= requested && (!found || level < best)) {
++			found = true;
++			best = level;
++			best_index = i;
++		}
++	}
++	if (!found) {
++		return ERANGE;
++	}
++	*selector = best_index;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -43,8 +43,12 @@
+ #define RH_DB_HEADER    144u
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
++#define RH_ARC          3u
+ #define RH_VRM          4u
+ #define RH_TIMEOUT_US   100000u
++
++extern int sweet_rpmh_arc_choose_level(const uint16_t *, unsigned,
++    uint32_t, uint32_t *);
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+ static uint32_t rh_db_size;
+@@ -205,6 +209,72 @@
+ 	return 0;
+ }
+ 
++/* ARC resources encode a selector table in CMD DB AUX data. */
++static int
++rh_lookup_arc(const char *res, uint32_t requested, uint32_t *address,
++    uint32_t *selector)
++{
++	uint32_t key[2] = {0, 0};
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	unsigned matches = 0;
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (slave < RH_ARC || slave > RH_VRM || (entries & 3u) ||
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			printf("SWEET RPMH: malformed ARC cmd-db slave header %u\n", i);
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			if (++matches != 1) {
++				printf("SWEET RPMH: duplicate ARC resource %s\n", res);
++				return EEXIST;
++			}
++			uint32_t addr = rh_read(rh_db, e + 16);
++			unsigned bytes = rh_db16(e + 20);
++			uint32_t map = aux + rh_db16(e + 22);
++			if (slave != RH_ARC || (addr >> 16) != RH_ARC || (addr & 15u) ||
++			    bytes < 2 || bytes > 32 || (bytes & 1u) ||
++			    !rh_range(map, bytes)) {
++				printf("SWEET RPMH: invalid ARC entry for %s\n", res);
++				return EINVAL;
++			}
++			uint16_t levels[16];
++			unsigned nlevels = bytes / 2;
++			for (unsigned k = 0; k < nlevels; ++k) {
++				levels[k] = rh_db16(map + k * 2);
++			}
++			int error = sweet_rpmh_arc_choose_level(levels, nlevels,
++			    requested, selector);
++			if (error) {
++				printf("SWEET RPMH: no safe ARC selector for %s level=%u\n",
++				    res, requested);
++				return error;
++			}
++			*address = addr;
++			printf("SWEET RPMH: ARC %s addr=%#x level=%u selector=%u\n",
++			    res, addr, requested, *selector);
++		}
++	}
++	if (matches != 1) {
++		printf("SWEET RPMH: ARC %s lookup matches=%u; refusing\n", res, matches);
++		return ENODEV;
++	}
++	return 0;
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
+@@ -324,6 +394,129 @@
+ 	return 0;
+ }
+ 
++/* One synchronous RPMh HLVL request, sharing the L11C client's TCS lock. */
++static int
++rh_send_arc(uint32_t address, uint32_t selector)
++{
++	if (selector >= 16 || (address >> 16) != RH_ARC || (address & 15u)) {
++		return EINVAL;
++	}
++	int chosen = -1;
++	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
++		uint32_t b = t * RH_TCS_STRIDE;
++		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
++		if (enabled & ~((1u << rh_ncpt) - 1u)) {
++			return EIO;
++		}
++		for (unsigned c = 0; c < rh_ncpt; ++c) {
++			if ((enabled & (1u << c)) &&
++			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
++				printf("SWEET RPMH: conflicting inherited ARC request in TCS%u\n", t);
++				return EBUSY;
++			}
++		}
++		if (chosen < 0 && rh_free(t)) {
++			chosen = (int)t;
++		}
++	}
++	if (chosen < 0) {
++		printf("SWEET RPMH: no empty idle ACTIVE TCS for ARC; leaving inherited state intact\n");
++		return EBUSY;
++	}
++	unsigned t = (unsigned)chosen;
++	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
++	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
++	if (irq_en == 0xffffffffu || !rh_free(t)) {
++		return EBUSY;
++	}
++	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
++		rh_poisoned = true;
++		return EIO;
++	}
++	if (!rh_free(t)) {
++		if (!rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++			rh_poisoned = true;
++		}
++		return EBUSY;
++	}
++	rh_poisoned = true;
++	printf("SWEET RPMH: TCS%u ACTIVE ARC HLVL selector=%u irq-enable=%#x\n",
++	    t, selector, irq_en);
++	if (!rh_sync(b + RH_MSGID, RH_WRITE_ACK) ||
++	    !rh_sync(b + RH_ADDR, address) || !rh_sync(b + RH_DATA, selector) ||
++	    !rh_sync(b + RH_WAIT, 1) || !rh_sync(b + RH_ENABLE, 1) ||
++	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
++	uint32_t irq = 0, idle = 0, status = 0;
++	bool done = false, progress = false;
++	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
++		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
++		idle = rh_read(rh_tcs, b + RH_STATUS);
++		status = rh_read(rh_tcs, b + RH_CMD_STATUS);
++		bool complete = status != 0xffffffffu &&
++		    (status & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
++		progress |= idle == 0 || !complete;
++		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
++		    ((irq & bit) || progress) && complete) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	printf("SWEET RPMH: TCS%u ARC done=%d irq=%#x idle=%#x status=%#x\n",
++	    t, done, irq, idle, status);
++	if (!done) {
++		printf("SWEET RPMH: ARC timeout; TCS quarantined, no reset/retry\n");
++		return ETIMEDOUT;
++	}
++	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
++	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, RH_IRQ_CLEAR, bit);
++	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
++	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++		return EIO;
++	}
++	rh_poisoned = false;
++	return 0;
++}
++
++int
++sweet_rpmh_arc_vote(const char *res, unsigned level)
++{
++	/* Only the GPU's three audited ARC rails and LOW_SVS are accepted. */
++	if (!res || (strcmp(res, "mx.lvl") && strcmp(res, "cx.lvl") &&
++	    strcmp(res, "gfx.lvl")) || level != 65) {
++		printf("SWEET RPMH: unsupported ARC resource/level\n");
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0, selector = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing ARC access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup_arc(res, level, &address, &selector);
++	}
++	if (!error) {
++		error = rh_send_arc(address, selector);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: ARC vote failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1,22 +1,27 @@
+ /*
+- * SWEET: opt-in, read-only GPU clock/power snapshot after ABL handoff.
++ * SWEET: opt-in GPU power-domain bring-up after ABL handoff.
+  *
+  * Register facts: MiCode Xiaomi_Kernel_OpenSource sweet-r-oss,
+  * drivers/clk/qcom/{gcc,gpucc}-sdmmagpie.c; GDSC addresses and GPUCC
+  * window are also present in this device's verified stock boot FDT.
+  *
+- * This is a prerequisite probe, not an accelerator. It never enables a
+- * clock, powers a domain, starts firmware, maps the GPU/GMU/SMMU, or submits
+- * a command. In particular, a powered GX status is not proof of rendering.
++ * The snapshot remains read-only. The separate opt-in CX stage votes the
++ * audited RPMh rails and enables only the CX GDSC; it does not start firmware,
++ * the GX graphics domain, or submit a rendering command.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/errno.h>
++#include <stdbool.h>
++#include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/OSAtomic.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_rpmh_arc_vote(const char *, unsigned);
+ void sweet_gpu_probe(void);
++void sweet_gpu_start(void);
+ 
+ #define GPU_GCC_PA          0x00100000
+ #define GPU_GCC_SIZE        0x00090000
+@@ -25,6 +30,12 @@
+ #define GCC_GPU_CFG_AHB     0x71004
+ #define CBCR_ENABLE        (1u << 0)
+ #define CBCR_CLK_OFF       (1u << 31)
++#define GPU_CX_GDSCR       0x106c
++#define GPU_CX_HW_CTRL     0x1540
++#define GDSCR_SW_COLLAPSE  (1u << 0)
++#define GDSCR_HW_CONTROL   (1u << 1)
++#define GDSCR_PWR_ON       (1u << 31)
++#define ARC_LEVEL_LOW_SVS  65u
+ 
+ static uint32_t
+ gpu_probe_rd(vm_offset_t base, uint32_t off)
+@@ -32,6 +43,14 @@
+     uint32_t value = *(volatile uint32_t *)(base + off);
+     OSMemoryBarrier();
+     return value;
++}
++
++static void
++gpu_probe_wr(vm_offset_t base, uint32_t off, uint32_t value)
++{
++    OSMemoryBarrier();
++    *(volatile uint32_t *)(base + off) = value;
++    OSMemoryBarrier();
+ }
+ 
+ void
+@@ -71,4 +90,88 @@
+     printf("SWEET GPU: GPUCC gx-gfx3d 0x%08x gx-gmu 0x%08x; execution not started\n",
+         gpu_probe_rd(cc, 0x1054), gpu_probe_rd(cc, 0x1064));
+ }
++
++void
++sweet_gpu_start(void)
++{
++    int mode = 0;
++    PE_parse_boot_argn("sweetgpustart", &mode, sizeof(mode));
++    if (mode != 1) {
++        return;
++    }
++
++    vm_offset_t gcc = ml_io_map(GPU_GCC_PA, GPU_GCC_SIZE);
++    if (gcc == 0) {
++        printf("SWEET GPU: CX start refused; GCC map failed\n");
++        return;
++    }
++    uint32_t cfg = gpu_probe_rd(gcc, GCC_GPU_CFG_AHB);
++    if ((cfg & (CBCR_ENABLE | CBCR_CLK_OFF)) != CBCR_ENABLE) {
++        printf("SWEET GPU: CX start refused; configuration AHB unavailable 0x%08x\n", cfg);
++        return;
++    }
++    vm_offset_t cc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
++    if (cc == 0) {
++        printf("SWEET GPU: CX start refused; GPUCC map failed\n");
++        return;
++    }
++
++    uint32_t cx_gdscr = gpu_probe_rd(cc, GPU_CX_GDSCR);
++    uint32_t cx_hw = gpu_probe_rd(cc, GPU_CX_HW_CTRL);
++    if (cx_gdscr == 0xffffffffu || cx_hw == 0xffffffffu) {
++        printf("SWEET GPU: CX start refused; invalid GDSC readback\n");
++        return;
++    }
++    if (cx_gdscr & GDSCR_HW_CONTROL) {
++        printf("SWEET GPU: CX start refused; GDSC is under hardware control\n");
++        return;
++    }
++
++    /* CX's DTS parent supply is cx.lvl, whose parent is mx.lvl. */
++    int error = sweet_rpmh_arc_vote("mx.lvl", ARC_LEVEL_LOW_SVS);
++    if (error) {
++        printf("SWEET GPU: CX start stopped at MX ARC vote (%d)\n", error);
++        return;
++    }
++    error = sweet_rpmh_arc_vote("cx.lvl", ARC_LEVEL_LOW_SVS);
++    if (error) {
++        printf("SWEET GPU: CX start stopped at CX ARC vote (%d)\n", error);
++        return;
++    }
++
++    cx_gdscr = gpu_probe_rd(cc, GPU_CX_GDSCR);
++    cx_hw = gpu_probe_rd(cc, GPU_CX_HW_CTRL);
++    if (cx_gdscr == 0xffffffffu || cx_hw == 0xffffffffu ||
++        (cx_gdscr & GDSCR_HW_CONTROL)) {
++        printf("SWEET GPU: CX start refused; GDSC state changed unexpectedly\n");
++        return;
++    }
++    if (!(cx_hw & GDSCR_PWR_ON)) {
++        if (!(cx_gdscr & GDSCR_SW_COLLAPSE)) {
++            printf("SWEET GPU: CX start refused; collapse/status mismatch gdscr=%#x hw=%#x\n",
++                cx_gdscr, cx_hw);
++            return;
++        }
++        gpu_probe_wr(cc, GPU_CX_GDSCR, cx_gdscr & ~GDSCR_SW_COLLAPSE);
++        delay(1); /* Match the documented 8-XO-cycle GDSC settle delay. */
++        bool on = false;
++        for (unsigned us = 0; us < 500; ++us) {
++            cx_hw = gpu_probe_rd(cc, GPU_CX_HW_CTRL);
++            if (cx_hw == 0xffffffffu) {
++                break;
++            }
++            if (cx_hw & GDSCR_PWR_ON) {
++                on = true;
++                break;
++            }
++            delay(1);
++        }
++        if (!on) {
++            printf("SWEET GPU: CX GDSC timed out gdscr=%#x hw=%#x\n",
++                gpu_probe_rd(cc, GPU_CX_GDSCR), cx_hw);
++            return;
++        }
++    }
++    printf("SWEET GPU: CX GDSC on; GMU/graphics clocks and firmware still off\n");
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_probe(void);
++extern void sweet_gpu_start(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -662,6 +663,7 @@
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_gpu_probe();
++	sweet_gpu_start();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_rpmh_arc.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
