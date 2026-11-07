@@ -2,6 +2,114 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> 2026-11-07 STAGE 0 (read first): PAC emulation written, not yet built or booted <<<
+
+New target set by the user on 2026-11-07: iOS 27 userland + iPhone 17 Pro identity
+(`docs/RETARGET-ios27.md`, `docs/PROMPT-ios27.md`). Stage 0 = PAC emulation in the
+kernel, accepted only by a QEMU run of an arm64e binary.
+
+**Environment (OBSERVED, this Windows box, cwd `C:\Users\Owner\Desktop\ios-sweet-main`):**
+- The checkout is a plain file snapshot: **no `.git`**; `xnu/` held only `patches/`
+  (0001-0081) + README. No XNU tree of any kind in the workspace initially.
+- No toolchain: `git`, `gh`, `clang`/LLVM, `qemu-system-aarch64`, `adb`, `fastboot`,
+  `make`, `cmake` MISSING; `wsl -l -v` = no distribution. Present: Python 3.15.2, Node,
+  network. `tools/qemu-sweet.py --check-env` fails on qemu + llvm-nm.
+  -> Nothing here can compile XNU (macOS-only) or run QEMU. The user is providing the
+  tree + `git`/`gh` (chosen on 2026-11-07); until then stage 0 is **unverified**.
+- Remote = local: `dipa-studio/ios-sweet` has the same 85 patches (last 0081). Last
+  successful `xnu` CI run **#94, 2026-10-18T19:18Z, sha `fdad0de8`**. Runs #1-#5
+  (2026-10-25/26, workflow `build-hackios-xnu`, `pull_request`, fork `zaidanfaiz`)
+  are stuck at `action_required` and are not this repo's builds.
+- Phone not reachable from here (no adb/fastboot). The 10-18 handoff below stands:
+  userdata = image v15, kernels 0078/0079 built, 0080 built but unbooted.
+
+**Base for the patch, verified from Apple's release metadata (not guessed):**
+- CI builds `MACOS_VERSION=13.5` -> `distribution-macOS/macos-135/release.json` ->
+  `xnu` tag **`xnu-8796.141.3`** (MasterVersion 22.6.0). That is the tree patch 0082
+  is written against; it was downloaded and the patch replays onto it byte-exactly.
+- Newest public xnu: **`xnu-12377.121.6`**, and `macos-260/release.json` says
+  `xnu-12377.1.9` -> xnu-12377 is the macOS 26 / iOS 26 generation.
+  `distribution-macOS` has branches only up to `rel/macOS-26`; there is **no
+  published xnu for macOS 27 / iOS 27**. So ETAP 1 ("xnu for iOS 27") has no
+  upstream source yet; stage 0 must be validated on xnu-8796, and that is what 0082
+  does. Do not label any base "iOS 27".
+
+**What stage 0 needed (both parts are in patch 0082), from reading the 8796 tree:**
+1. `osfmk/arm64/sleh.c`: unknown-instruction exceptions land in
+   `handle_uncategorized()` (EC = 0x00; `ELR_EL1` still points *at* the faulting
+   instruction because an unknown exception does not skip it). Hook there, user
+   mode only: `sweet_pac_emulate(state, instr)`.
+2. `bsd/dev/arm/kern_machdep.c`: `grade_binary()` rejects `CPU_SUBTYPE_ARM64E` when
+   the host subtype is not arm64e (`osfmk/arm64/cpu.c:711` gives an ARMv8 CPU
+   `CPU_SUBTYPE_ARM64_V8`), so an arm64e slice dies with EBADARCH **before** any PAC
+   instruction runs. 0082 accepts arm64e on SWEET (grade 11).
+
+**What 0082 does:** new `osfmk/arm64/sweet_pac.{c,h}` (registered in
+`osfmk/conf/files.arm64`): a 40-entry decode table (mask/match) for
+PACIA/PACIB/PACDA/PACDB, AUTIA/AUTIB/AUTDA/AUTDB, the Z forms (PACIZA..AUTDZB),
+XPACI/XPACD, BRAA/BRAB/BLRAA/BLRAB and their Z forms, RETAA/RETAB, plus the
+HINT-space PAC encodings. Semantics: `pac*/aut*` = value unchanged (`Rd := Rn`,
+Z forms `Rd := 0`), `xpac*` = unchanged, `braa*` = `br`, `blraa*` = `blr`
+(`x30 := pc+4`), `retaa*` = `ret`; PC advanced correctly and the existing handlers
+untouched. Deliberately NOT emulated (they keep SIGILL, because a no-op would be a
+wrong answer rather than an unauthenticated one): **PACGA** (real QARMA MAC),
+**LDRAA/LDRAB** (authenticated loads), ERETAA/ERETAB (EL1-only).
+Boot-args: `sweetpac=0` disables, `sweetpaclog=1` logs each emulated class once.
+
+**Evidence gathered WITHOUT the compiler (all reproducible, commands below):**
+- Encodings taken from binutils `opcodes/aarch64-tbl.h` (fetched to
+  `research/aarch64-tbl.h`), not from memory: 40 patterns, 0 overlaps, and scanning
+  all **3902** AArch64 instruction patterns in that file gives **0 false positives**
+  (`research/tools/pacgen.py`).
+- `xnu/patches/0082-sweet-arm64e-pac.patch` (12060 bytes, 5 files) replays onto a
+  pristine `xnu-8796.141.3` tree and reproduces the edited files byte-for-byte
+  (`research/tools/mkpatch.py` + `research/tools/applycheck.py`; `git` is absent, so
+  the applier is a strict no-fuzz reimplementation of `git apply`).
+- Test fixture `tools/mkpacexe.py` builds a static **arm64e** Mach-O
+  (cpusubtype 0x81000002 = ARM64E | ptrauth ABI v1) that starts with `pacibsp` and
+  runs 10 checks (PACIA/PACIB/PACDA/AUTIA/XPACI/PACIZA/AUTIZA/BRAA/BLRAAZ/RETAA),
+  then prints `SWEET PAC TEST: PASS 10/10 checks, exit status 0` and calls
+  `exit(0)`. Every emitted word was disassembled against the same binutils table
+  (`research/tools/verifyenc.py`: 62/62 words recognised, all intended mnemonics).
+- Simulated end to end with the emulation semantics
+  (`research/tools/simpacexe.py`): result `PASS 10/10`, exit status 0; the control
+  run with emulation off faults at the **first** `pacia` (pc=13), i.e. the test
+  really exercises the trap. `pacibsp` (word 0) does not fault, as expected for a
+  HINT-space encoding on ARMv8.2.
+- On a PID-1 exit the kernel panics by design (`bsd/kern/kern_exit.c:1806-1828`),
+  and `proc_handle_critical_exit()` prints
+  `initproc exited -- ... (signal 0, exit status 0)`. That line is the
+  machine-checkable proof of "exit code 0"; the runner greps for it and for the
+  PASS line (`tools/run-pac-test.sh`), and treats that one panic as expected.
+
+**NOT DONE (do not claim otherwise):** patch 0082 has never been compiled, never
+booted in QEMU, never run on the phone. There is no CI run and no log for it yet;
+NOTHING in README/site/docs was changed to say iOS 27 or iPhone 17 Pro works.
+
+**Next concrete steps, in order:**
+1. With `git`+`gh`: commit 0082 + `tools/mkpacexe.py` + `tools/run-pac-test.sh`
+   (trailer `Co-Authored-By: dipa-studio`), push, `gh workflow run xnu.yml -R
+   dipa-studio/ios-sweet`, then `gh run download <id> -n xnu-kernel -D xnu/out-0082`.
+2. On a Linux machine with qemu: `tools/run-pac-test.sh xnu/out-0082/kernel.development.sweet`
+   and paste the `serial.txt` markers + the `initproc exited ... exit status 0`
+   line into this file. If the kernel does not build, fix the patch (likely first
+   candidates: the `bool` TUNABLE and the `kprintf` format) and rebuild.
+3. Only then move to ETAP 1 (no iOS 27 xnu exists; the honest base is xnu-12377 =
+   macOS/iOS 26 generation, and it needs a full re-derivation of 0001-0082).
+
+Reproducing the analysis offline (no toolchain needed):
+```
+python research/tools/pacgen.py research/aarch64-tbl.h      # decode table + validation
+python tools/mkpacexe.py research/pac-test.bin              # arm64e fixture
+python research/tools/verifyenc.py research/pac-test.bin    # disassemble emitted words
+python research/tools/simpacexe.py research/pac-test.bin    # program logic + emulation
+python research/tools/mkpatch.py xnu/patches/0082-sweet-arm64e-pac.patch
+python research/tools/applycheck.py xnu/patches/0082-sweet-arm64e-pac.patch \
+    research/apply-base research/apply-out research/src/xnu-xnu-8796.141.3
+```
+(`research/` is gitignored: the downloaded xnu trees, binutils table and helper
+scripts are not committed; the fixtures and the patch are.)
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**

@@ -1,0 +1,328 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -37,6 +37,7 @@
+ #include <arm64/machine_machdep.h>
+ #include <arm64/monotonic.h>
+ #include <arm64/instructions.h>
++#include <arm64/sweet_pac.h>
+ 
+ #include <kern/debug.h>
+ #include <kern/restartable.h>
+@@ -887,6 +888,19 @@
+ 	uint32_t                   instr     = 0;
+ 
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
++
++#if defined(SWEET)
++	/*
++	 * sweet has no pointer authentication but the iOS 17+ userland is
++	 * arm64e: pac*/aut*/xpac*, braa*/blraa* and retaa trap here as unknown
++	 * instructions.  If this is one of them the saved PC is advanced (to the
++	 * next instruction or to the branch target) and we resume user mode
++	 * instead of delivering SIGILL.
++	 */
++	if (sweet_pac_emulate(state, instr)) {
++		return;
++	}
++#endif /* SWEET */
+ 
+ #if CONFIG_DTRACE
+ 
+diff --git a/osfmk/arm64/sweet_pac.c b/osfmk/arm64/sweet_pac.c
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm64/sweet_pac.c
+@@ -0,0 +1,233 @@
++/*
++ * Pointer-authentication emulation for sweet (ARMv8.2-A, no PAC).
++ *
++ * Every iPhone that runs iOS 17 or later ships an arm64e userland.  sweet's
++ * Kryo 470 cores do not implement ARMv8.3 pointer authentication, so the first
++ * PAC instruction in the prologue of the first arm64e function raises an
++ * undefined-instruction exception (ESR_EL1.EC = 0x00, "unknown") and the
++ * process dies with SIGILL.
++ *
++ * The emulation policy is deliberately the "no signature" one:
++ *
++ *   pac* / aut*   sign/authenticate with a zero key: the value is unchanged
++ *                 (Rd := Rn, so PACIZA/PACDZA & co. write 0 because Rn is XZR)
++ *   xpac*         strip a signature that was never added: register unchanged
++ *   braa / blraa /
++ *   braaz / blraaz  plain br / blr (the modifier register is ignored)
++ *   retaa / retab   plain ret (pc := x30)
++ *
++ * That is consistent as long as *both* signing and stripping are no-ops: a
++ * pointer keeps the exact value it would have had without PAC.
++ *
++ * Not emulated on purpose, because a no-op would be wrong rather than merely
++ * unauthenticated:
++ *   PACGA   computes a real 64-bit MAC (QARMA); a program that compares its
++ *           result needs the real algorithm, so it keeps faulting.
++ *   LDRAA / LDRAB  authenticated loads; they need the load to be performed
++ *           (and a possible fault to be reported), which is a separate piece
++ *           of work.  They keep faulting.
++ *   ERETAA / ERETAB  only valid at EL1, i.e. never reachable from user mode.
++ *
++ * HINT-space encodings (PACIBSP, AUTIBSP, PACIA1716, PACIAZ, ...) are
++ * architecturally NOPs on a CPU without FEAT_PAuth and never fault, but they
++ * are listed here anyway: they cost nothing and make the behaviour explicit
++ * for an emulator or CPU that chooses to trap them.
++ *
++ * The decode table was generated from binutils' aarch64-tbl.h and checked
++ * against all 3902 AArch64 instruction patterns there (no false positives);
++ * see research/tools/pacgen.py.
++ */
++#include <arm64/sweet_pac.h>
++
++#if defined(SWEET)
++#include <arm64/proc_reg.h>
++#include <kern/startup.h>
++#include <pexpert/pexpert.h>
++
++/*
++ * sweetpac=0 disables the emulation (any arm64e binary then dies on its first
++ * PAC instruction, as before).  sweetpaclog=1 logs every emulated class once,
++ * up to SWEET_PAC_LOG_MAX lines, which is what a bring-up boot needs.
++ */
++TUNABLE(bool, sweet_pac_enable, "sweetpac", true);
++TUNABLE(bool, sweet_pac_verbose, "sweetpaclog", false);
++
++#define SWEET_PAC_LOG_MAX 32
++
++enum sweet_pac_kind {
++	SWEET_PAC_SIGN = 1,     /* Rd := Rn (sign with no signature) */
++	SWEET_PAC_ZERO,         /* Rd := 0 (Rn is XZR) */
++	SWEET_PAC_XPAC,         /* register unchanged */
++	SWEET_PAC_HINT,         /* NOP on v8.2; no state change */
++	SWEET_PAC_BR,           /* pc := Rn */
++	SWEET_PAC_BLR,          /* lr := pc + 4, pc := Rn */
++	SWEET_PAC_RET,          /* pc := x30 */
++};
++
++struct sweet_pac_op {
++	uint32_t                op_mask;
++	uint32_t                op_match;
++	enum sweet_pac_kind     op_kind;
++};
++
++/* Generated from binutils aarch64-tbl.h by research/tools/pacgen.py. */
++static const struct sweet_pac_op sweet_pac_ops[] = {
++	{ 0xfffffc00u, 0xdac10000u, SWEET_PAC_SIGN },   /* pacia */
++	{ 0xfffffc00u, 0xdac10400u, SWEET_PAC_SIGN },   /* pacib */
++	{ 0xfffffc00u, 0xdac10800u, SWEET_PAC_SIGN },   /* pacda */
++	{ 0xfffffc00u, 0xdac10c00u, SWEET_PAC_SIGN },   /* pacdb */
++	{ 0xfffffc00u, 0xdac11000u, SWEET_PAC_SIGN },   /* autia */
++	{ 0xfffffc00u, 0xdac11400u, SWEET_PAC_SIGN },   /* autib */
++	{ 0xfffffc00u, 0xdac11800u, SWEET_PAC_SIGN },   /* autda */
++	{ 0xfffffc00u, 0xdac11c00u, SWEET_PAC_SIGN },   /* autdb */
++	{ 0xffffffe0u, 0xdac123e0u, SWEET_PAC_ZERO },   /* paciza */
++	{ 0xffffffe0u, 0xdac127e0u, SWEET_PAC_ZERO },   /* pacizb */
++	{ 0xffffffe0u, 0xdac12be0u, SWEET_PAC_ZERO },   /* pacdza */
++	{ 0xffffffe0u, 0xdac12fe0u, SWEET_PAC_ZERO },   /* pacdzb */
++	{ 0xffffffe0u, 0xdac133e0u, SWEET_PAC_ZERO },   /* autiza */
++	{ 0xffffffe0u, 0xdac137e0u, SWEET_PAC_ZERO },   /* autizb */
++	{ 0xffffffe0u, 0xdac13be0u, SWEET_PAC_ZERO },   /* autdza */
++	{ 0xffffffe0u, 0xdac13fe0u, SWEET_PAC_ZERO },   /* autdzb */
++	{ 0xffffffe0u, 0xdac143e0u, SWEET_PAC_XPAC },   /* xpaci */
++	{ 0xffffffe0u, 0xdac147e0u, SWEET_PAC_XPAC },   /* xpacd */
++	{ 0xfffffc00u, 0xd71f0800u, SWEET_PAC_BR },     /* braa */
++	{ 0xfffffc00u, 0xd71f0c00u, SWEET_PAC_BR },     /* brab */
++	{ 0xfffffc1fu, 0xd61f081fu, SWEET_PAC_BR },     /* braaz */
++	{ 0xfffffc1fu, 0xd61f0c1fu, SWEET_PAC_BR },     /* brabz */
++	{ 0xfffffc00u, 0xd73f0800u, SWEET_PAC_BLR },    /* blraa */
++	{ 0xfffffc00u, 0xd73f0c00u, SWEET_PAC_BLR },    /* blrab */
++	{ 0xfffffc1fu, 0xd63f081fu, SWEET_PAC_BLR },    /* blraaz */
++	{ 0xfffffc1fu, 0xd63f0c1fu, SWEET_PAC_BLR },    /* blrabz */
++	{ 0xffffffffu, 0xd65f0bffu, SWEET_PAC_RET },    /* retaa */
++	{ 0xffffffffu, 0xd65f0fffu, SWEET_PAC_RET },    /* retab */
++	{ 0xffffffffu, 0xd503233fu, SWEET_PAC_HINT },   /* paciasp */
++	{ 0xffffffffu, 0xd503237fu, SWEET_PAC_HINT },   /* pacibsp */
++	{ 0xffffffffu, 0xd50323bfu, SWEET_PAC_HINT },   /* autiasp */
++	{ 0xffffffffu, 0xd50323ffu, SWEET_PAC_HINT },   /* autibsp */
++	{ 0xffffffffu, 0xd503231fu, SWEET_PAC_HINT },   /* paciaz */
++	{ 0xffffffffu, 0xd503235fu, SWEET_PAC_HINT },   /* pacibz */
++	{ 0xffffffffu, 0xd503239fu, SWEET_PAC_HINT },   /* autiaz */
++	{ 0xffffffffu, 0xd50323dfu, SWEET_PAC_HINT },   /* autibz */
++	{ 0xffffffffu, 0xd503211fu, SWEET_PAC_HINT },   /* pacia1716 */
++	{ 0xffffffffu, 0xd503215fu, SWEET_PAC_HINT },   /* pacib1716 */
++	{ 0xffffffffu, 0xd503219fu, SWEET_PAC_HINT },   /* autia1716 */
++	{ 0xffffffffu, 0xd50321dfu, SWEET_PAC_HINT },   /* autib1716 */
++};
++
++static unsigned int sweet_pac_emulated;
++static unsigned int sweet_pac_logged;
++
++static const struct sweet_pac_op *
++sweet_pac_lookup(uint32_t instr)
++{
++	for (unsigned int i = 0;
++	    i < (unsigned int)(sizeof(sweet_pac_ops) / sizeof(sweet_pac_ops[0])); i++) {
++		const struct sweet_pac_op *op = &sweet_pac_ops[i];
++		if ((instr & op->op_mask) == op->op_match) {
++			return op;
++		}
++	}
++	return NULL;
++}
++
++static const char *
++sweet_pac_kind_name(enum sweet_pac_kind kind)
++{
++	switch (kind) {
++	case SWEET_PAC_SIGN: return "pac/aut";
++	case SWEET_PAC_ZERO: return "pac/aut (Z)";
++	case SWEET_PAC_XPAC: return "xpac";
++	case SWEET_PAC_HINT: return "pac hint";
++	case SWEET_PAC_BR:   return "braa";
++	case SWEET_PAC_BLR:  return "blraa";
++	case SWEET_PAC_RET:  return "retaa";
++	}
++	return "?";
++}
++
++/*
++ * Emulate one PAC instruction in a faulting user-mode state.  Returns TRUE
++ * when the instruction was handled and the saved state was advanced (the
++ * caller must return to user mode); FALSE leaves the existing SIGILL path
++ * untouched.
++ *
++ * Called from handle_uncategorized() with the saved state of a 64-bit user
++ * process, i.e. ELR_EL1 still points at the faulting instruction (an unknown
++ * exception does not skip it, unlike SVC).
++ */
++boolean_t
++sweet_pac_emulate(arm_saved_state_t *state, uint32_t instr)
++{
++	const struct sweet_pac_op *op;
++	unsigned int rd = instr & 0x1fu;
++	unsigned int rn = (instr >> 5) & 0x1fu;
++	register_t pc;
++	register_t value;
++
++	if (!sweet_pac_enable) {
++		return FALSE;
++	}
++	if (!is_saved_state64(state) || !PSR64_IS_USER64(get_saved_state_cpsr(state))) {
++		return FALSE;
++	}
++
++	op = sweet_pac_lookup(instr);
++	if (op == NULL) {
++		return FALSE;
++	}
++
++	pc = get_saved_state_pc(state);
++
++	switch (op->op_kind) {
++	case SWEET_PAC_SIGN:
++		/* PACIA Rd, Rn == Rd := Rn (a zero key adds no bits). */
++		if (rd != 31) {
++			value = (rn == 31) ? get_saved_state_sp(state) : get_saved_state_reg(state, rn);
++			set_saved_state_reg(state, rd, value);
++		}
++		set_saved_state_pc(state, pc + 4);
++		break;
++
++	case SWEET_PAC_ZERO:
++		/* PACIZA Rd & co.: Rn is XZR, so the signed value is 0. */
++		if (rd != 31) {
++			set_saved_state_reg(state, rd, 0);
++		}
++		set_saved_state_pc(state, pc + 4);
++		break;
++
++	case SWEET_PAC_XPAC:
++	case SWEET_PAC_HINT:
++		set_saved_state_pc(state, pc + 4);
++		break;
++
++	case SWEET_PAC_BR:
++		set_saved_state_pc(state, (rn == 31) ? 0 : get_saved_state_reg(state, rn));
++		break;
++
++	case SWEET_PAC_BLR:
++		set_saved_state_lr(state, pc + 4);
++		set_saved_state_pc(state, (rn == 31) ? 0 : get_saved_state_reg(state, rn));
++		break;
++
++	case SWEET_PAC_RET:
++		/* RETAA/RETAB authenticate x30, which is a no-op here. */
++		set_saved_state_pc(state, get_saved_state_lr(state));
++		break;
++
++	default:
++		return FALSE;
++	}
++
++	sweet_pac_emulated++;
++	if (sweet_pac_verbose && sweet_pac_logged < SWEET_PAC_LOG_MAX) {
++		sweet_pac_logged++;
++		kprintf("SWEET PAC: %s instr %#x pc %#llx -> %#llx (rd %u rn %u)\n",
++		    sweet_pac_kind_name(op->op_kind), instr,
++		    (unsigned long long)pc, (unsigned long long)get_saved_state_pc(state),
++		    rd, rn);
++	}
++
++	return TRUE;
++}
++#endif /* SWEET */
+diff --git a/osfmk/arm64/sweet_pac.h b/osfmk/arm64/sweet_pac.h
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm64/sweet_pac.h
+@@ -0,0 +1,17 @@
++/*
++ * Pointer-authentication emulation for sweet (ARMv8.2-A without PAC).
++ * See osfmk/arm64/sweet_pac.c for the policy and its limits.
++ */
++#ifndef _OSFMK_ARM64_SWEET_PAC_H_
++#define _OSFMK_ARM64_SWEET_PAC_H_
++
++#include <mach/boolean.h>
++#include <mach/machine/thread_status.h>
++
++/*
++ * Emulate a PAC instruction that trapped as an unknown exception in a
++ * 64-bit user-mode saved state.  TRUE: handled, state advanced.
++ */
++boolean_t sweet_pac_emulate(arm_saved_state_t *state, uint32_t instr);
++
++#endif /* _OSFMK_ARM64_SWEET_PAC_H_ */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -50,6 +50,7 @@
+ osfmk/arm64/gxf_exceptions.s	optional nos_arm_asm
+ osfmk/arm64/lowmem_vectors.c	standard
+ osfmk/arm64/sleh.c			standard
++osfmk/arm64/sweet_pac.c			standard
+ osfmk/arm64/start.s	optional nos_arm_asm config_pmap_ppl
+ osfmk/arm64/pinst.s	optional nos_arm_asm
+ osfmk/arm64/cswitch.s	optional nos_arm_asm
+diff --git a/bsd/dev/arm/kern_machdep.c b/bsd/dev/arm/kern_machdep.c
+--- a/bsd/dev/arm/kern_machdep.c
++++ b/bsd/dev/arm/kern_machdep.c
+@@ -79,6 +79,22 @@
+ 	cpu_subtype_t hostsubtype = cpu_subtype();
+ #endif /* __arm64__ */
+ 
++#if defined(SWEET)
++	/*
++	 * sweet implements no pointer authentication (ARMv8.2-A), so its
++	 * cpu_subtype() is never CPU_SUBTYPE_ARM64E and the switch below would
++	 * reject every arm64e slice with EBADARCH.  The iOS 17+ userland is
++	 * arm64e-only and the PAC instructions it executes are emulated as
++	 * no-ops in the unknown-instruction handler
++	 * (osfmk/arm64/sweet_pac.c), so accept the slice.  Grade 11 is the
++	 * "future ABI, run it like an arm64 slice" grade, chosen so a fat binary
++	 * carrying both slices prefers the arm64e one, as on real hardware.
++	 */
++	if (exectype == CPU_TYPE_ARM64 && execsubtype == CPU_SUBTYPE_ARM64E) {
++		return 11;
++	}
++#endif /* SWEET */
++
+ 	switch (exectype) {
+ #if __arm64__
+ 	case CPU_TYPE_ARM64:
