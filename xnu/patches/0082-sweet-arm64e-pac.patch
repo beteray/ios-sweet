@@ -17,10 +17,10 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 +#if defined(SWEET)
 +	/*
 +	 * sweet has no pointer authentication but the iOS 17+ userland is
-+	 * arm64e: pac*/aut*/xpac*, braa*/blraa* and retaa trap here as unknown
-+	 * instructions.  If this is one of them the saved PC is advanced (to the
-+	 * next instruction or to the branch target) and we resume user mode
-+	 * instead of delivering SIGILL.
++	 * arm64e: the pac, aut, xpac, braa, blraa and retaa encodings trap here
++	 * as unknown instructions.  If this is one of them the saved PC is
++	 * advanced (to the next instruction or to the branch target) and we
++	 * resume user mode instead of delivering SIGILL.
 +	 */
 +	if (sweet_pac_emulate(state, instr)) {
 +		return;
@@ -271,7 +271,7 @@ diff --git a/osfmk/arm64/sweet_pac.h b/osfmk/arm64/sweet_pac.h
 new file mode 100644
 --- /dev/null
 +++ b/osfmk/arm64/sweet_pac.h
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,18 @@
 +/*
 + * Pointer-authentication emulation for sweet (ARMv8.2-A without PAC).
 + * See osfmk/arm64/sweet_pac.c for the policy and its limits.
@@ -279,6 +279,7 @@ new file mode 100644
 +#ifndef _OSFMK_ARM64_SWEET_PAC_H_
 +#define _OSFMK_ARM64_SWEET_PAC_H_
 +
++#include <stdint.h>
 +#include <mach/boolean.h>
 +#include <mach/machine/thread_status.h>
 +

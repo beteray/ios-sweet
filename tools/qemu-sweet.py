@@ -22,6 +22,23 @@ An undecodable or blank screen returns 3 with --fail-on-panic.
 """
 import argparse, json, os, shutil, socket, struct, subprocess, sys, time, zlib
 
+# Windows builds of QEMU have no AF_UNIX sockets, so QMP goes over TCP there and
+# the -serial/-qmp file arguments need forward slashes (otherwise the colon of
+# "C:\..." is parsed as part of QEMU's file: option).
+IS_WINDOWS = sys.platform.startswith('win')
+
+
+def qemu_path(path):
+    return path.replace(os.sep, '/') if IS_WINDOWS else path
+
+
+def free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
 FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
 FB_STRIDE = FB_W * 4
 PAGE = 0x4000
@@ -58,19 +75,47 @@ def check_qemu_dependency(cpu='cortex-a76'):
     return True
 
 
+def kernel_symbols(kernel_path, wanted):
+    """Return {name: address} for wanted symbols, without llvm-nm.
+
+    llvm-nm is not always installed (it is not part of Python or QEMU), but the
+    only thing it is used for here is finding _iso_font in the kernel's Mach-O
+    symbol table, which is a few lines of struct.unpack.
+    """
+    blob = open(kernel_path, 'rb').read()
+    magic, cputype, cpusubtype, ftype, ncmds = struct.unpack_from('<5I', blob, 0)
+    if magic != 0xFEEDFACF:
+        raise SystemExit(f'{kernel_path}: not a 64-bit Mach-O')
+    off = 32
+    symtab = None
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from('<II', blob, off)
+        if cmd == 0x2:                          # LC_SYMTAB
+            symtab = struct.unpack_from('<4I', blob, off + 8)
+        off += cmdsize
+    if symtab is None:
+        raise SystemExit(f'{kernel_path}: no LC_SYMTAB')
+    symoff, nsyms, stroff, strsize = symtab
+    found = {}
+    for i in range(nsyms):
+        strx, ntype, _sect, _desc, value = struct.unpack_from('<IBBHQ', blob, symoff + 16 * i)
+        if not strx or strx >= strsize:
+            continue
+        end = blob.find(b'\0', stroff + strx)
+        name = blob[stroff + strx:end].decode('latin1')
+        if name in wanted:
+            found[name] = value
+    return found
+
+
 def check_kernel_tools(kernel_path):
-    """Verify llvm-nm is available when --kernel is specified."""
-    if not shutil.which('llvm-nm'):
-        print('[!] Error: llvm-nm not found in PATH, required for --kernel font extraction.', file=sys.stderr)
-        print('    Install instructions:', file=sys.stderr)
-        print('      Arch Linux:    sudo pacman -S llvm', file=sys.stderr)
-        print('      Ubuntu/Debian: sudo apt install llvm', file=sys.stderr)
-        print('      Fedora:         sudo dnf install llvm', file=sys.stderr)
-        print('      macOS:          brew install llvm', file=sys.stderr)
-        return False
+    """Verify the kernel file exists; llvm-nm is optional (see kernel_symbols).
+    """
     if not os.path.isfile(kernel_path):
         print(f'[!] Error: kernel file does not exist: {kernel_path}', file=sys.stderr)
         return False
+    if not shutil.which('llvm-nm'):
+        print('[*] llvm-nm not found; reading _iso_font from the Mach-O symtab instead', file=sys.stderr)
     return True
 
 
@@ -161,10 +206,16 @@ def screen_result(screen, unknown):
     return {'status': status, 'unknown_glyphs': unknown, 'snapshot_only': True}
 
 
-def qmp(sock_path, *cmds, pmemsave=None):
-    """Run QEMU human-monitor commands over QMP (synchronous, unlike the echoing HMP socket)."""
-    s = socket.socket(socket.AF_UNIX)
-    s.connect(sock_path)
+def qmp(addr, *cmds, pmemsave=None):
+    """Run QEMU human-monitor commands over QMP (synchronous, unlike the echoing HMP socket).
+
+    addr is the unix socket path, or (host, port) on Windows where QMP is TCP.
+    """
+    if isinstance(addr, tuple):
+        s = socket.create_connection(addr, timeout=15)
+    else:
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(addr)
     f = s.makefile('rw')
     f.readline()
 
@@ -227,6 +278,8 @@ def main():
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
+    ap.add_argument('--snapshot-at', type=float, action='append', default=[],
+                    help='save and decode the framebuffer this many seconds into the run (repeatable)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
 
@@ -253,12 +306,10 @@ def main():
     payload = open(a.payload, 'rb').read()
     font = None
     if a.kernel:
-        symbols = subprocess.check_output(['llvm-nm', '--defined-only', a.kernel], text=True)
-        fonts = [int(line.split()[0], 16) for line in symbols.splitlines()
-                 if line.split()[-1:] == ['_iso_font']]
-        if len(fonts) != 1:
-            ap.error('kernel must contain exactly one _iso_font symbol')
-        font = payload_data(payload, fonts[0], 256 * 16)
+        syms = kernel_symbols(a.kernel, {'_iso_font'})
+        if '_iso_font' not in syms:
+            ap.error('kernel must contain a _iso_font symbol')
+        font = payload_data(payload, syms['_iso_font'], 256 * 16)
     os.makedirs(a.outdir, exist_ok=True)
     out = os.path.abspath(a.outdir)
 
@@ -268,16 +319,23 @@ def main():
     print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
 
     mon = f'{out}/mon.sock'
-    if os.path.exists(mon):
-        os.unlink(mon)
+    if IS_WINDOWS:
+        mon = ('127.0.0.1', free_port())
+        qmp_arg = f'tcp:{mon[0]}:{mon[1]},server,nowait'
+        display_arg = ['-display', 'none']
+    else:
+        if os.path.exists(mon):
+            os.unlink(mon)
+        qmp_arg = f'unix:{mon},server,nowait'
+        display_arg = ['-nographic']
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
-           '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
-           '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
-           '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
-           '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
+           *display_arg, '-serial', f'file:{qemu_path(out)}/serial.txt', '-qmp', qmp_arg,
+           '-d', 'int,guest_errors,unimp', '-D', f'{qemu_path(out)}/qemu.log', '-no-reboot',
+           '-device', f'loader,file={qemu_path(out)}/ram.bin,addr={phys_base:#x},force-raw=on',
+           '-device', f'loader,file={qemu_path(out)}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
     if a.gdb:
         cmd += ['-S', '-gdb', 'tcp::1234']
@@ -294,9 +352,25 @@ def main():
             return 0
 
         t0 = time.time()
+        pending_snaps = sorted(a.snapshot_at)
+
+        def take_snapshot(tag):
+            raw_path = f'{out}/fb-{tag}.raw'
+            qmp(mon, pmemsave=(FB_BASE, FB_STRIDE * FB_H, qemu_path(raw_path)))
+            raw_snap = open(raw_path, 'rb').read()
+            write_png(f'{out}/fb-{tag}.png', raw_snap)
+            if font is not None:
+                screen_snap, _unknown = decode_screen(raw_snap, font)
+                open(f'{out}/fb-{tag}.txt', 'w').write(screen_snap)
+            os.unlink(raw_path)
+            print(f'snapshot at {tag}s -> {out}/fb-{tag}.txt', file=sys.stderr)
+
         while p.poll() is None and time.time() - t0 < a.secs:
             if a.live_serial:
                 serial_pos = stream_serial_file(serial_file, serial_pos)
+            elapsed = time.time() - t0
+            while pending_snaps and elapsed >= pending_snaps[0]:
+                take_snapshot(int(pending_snaps.pop(0)))
             time.sleep(0.2)
 
         if a.live_serial:
@@ -304,7 +378,7 @@ def main():
 
         result = {'status': 'qemu_exited', 'qemu_returncode': p.returncode}
         if p.poll() is None:
-            _, regs, *extra = qmp(mon, 'stop', 'info registers', *a.hmp, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
+            _, regs, *extra = qmp(mon, 'stop', 'info registers', *a.hmp, pmemsave=(FB_BASE, FB_STRIDE * FB_H, qemu_path(f'{out}/fb.raw')))
             open(f'{out}/regs.txt', 'w').write(regs + ''.join(f'\n(qemu) {c}\n{r}' for c, r in zip(a.hmp, extra)))
             p.kill()
             p.wait()

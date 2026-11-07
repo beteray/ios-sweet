@@ -21,7 +21,11 @@ No assembler is required: the code is emitted as instruction words.  The PAC
 encodings come from the same verified table as the kernel decoder
 (research/tools/pacgen.py, ground truth: binutils aarch64-tbl.h).
 
-Usage: mkpacexe.py OUT.bin
+Usage: mkpacexe.py OUT.bin [--subtype arm64e|arm64]
+
+--subtype arm64 emits the same PAC code with CPU_SUBTYPE_ARM64_ALL: the kernel
+accepts such a binary (grade 9) but still SIGILLs on the first PAC instruction,
+which is the control run that proves the trap is real.
 """
 import io
 import struct
@@ -35,9 +39,10 @@ BASE, SEG, CODE_OFF = mkinit.BASE, mkinit.SEG, mkinit.CODE_OFF
 CPU_SUBTYPE_ARM64E = 2
 CPU_SUBTYPE_PTRAUTH_ABI = 0x80000000
 PTRAUTH_ABI_VERSION = 1          # bits 24..27; clang -arch arm64e emits this
-CPUSUBTYPE = CPU_SUBTYPE_PTRAUTH_ABI | (PTRAUTH_ABI_VERSION << 24) | CPU_SUBTYPE_ARM64E
+CPUSUBTYPE_ARM64E = CPU_SUBTYPE_PTRAUTH_ABI | (PTRAUTH_ABI_VERSION << 24) | CPU_SUBTYPE_ARM64E
+CPUSUBTYPE_ARM64 = 0             # CPU_SUBTYPE_ARM64_ALL, no ptrauth ABI bits
 
-SYS_exit, SYS_write, SYS_open = 1, 4, 5
+SYS_exit, SYS_write, SYS_open, SYS_select = 1, 4, 5, 93
 O_RDWR = 2
 
 
@@ -216,6 +221,10 @@ def build_program():
     p.bcond(COND_CS, 'hang')
     p.emit(add_imm(19, 0, 0))             # x19 = x0 (fd)
     p.bl('write_banner')
+    # Give the runner a window to snapshot the banner before a PAC fault (on an
+    # unpatched kernel) or before the PID-1 exit panic (on a patched one).
+    p.adr(4, 'sleep_tv')
+    p.emit(movz(0, 0), movz(1, 0), movz(2, 0), movz(3, 0), movz(16, SYS_select), svc())
 
     # x9 = 0x1122334455667788
     p.emit(*mov_const(9, 0x1122334455667788))
@@ -265,6 +274,10 @@ def build_program():
     p.label('ret_ok')
 
     p.bl('write_pass')
+    # Stay alive for a few seconds so a mid-run framebuffer snapshot can show
+    # the PASS line (a PID-1 exit immediately panics and redraws the screen).
+    p.adr(4, 'sleep_tv')
+    p.emit(movz(0, 0), movz(1, 0), movz(2, 0), movz(3, 0), movz(16, SYS_select), svc())
     p.emit(MOV_X0_ZERO, MOV_X16_EXIT, svc())
 
     p.label('hang')
@@ -294,6 +307,8 @@ def build_program():
         p.label(label + '_end')
 
     data('path', '/dev/console\0\0\0\0')
+    p.label('sleep_tv')                  # struct timeval {10 s, 0 us}
+    p.emit(10, 0, 0, 0)
     banner = ('SWEET PAC TEST: arm64e binary running, prologue PACIBSP ok\n')
     data('banner', banner)
     data('pass', 'SWEET PAC TEST: PASS 10/10 checks, exit status 0\n')
@@ -307,6 +322,12 @@ def build_program():
 
 def main():
     out = sys.argv[1]
+    subtype = 'arm64e'
+    if '--subtype' in sys.argv:
+        subtype = sys.argv[sys.argv.index('--subtype') + 1]
+    if subtype not in ('arm64e', 'arm64'):
+        raise SystemExit('--subtype must be arm64e or arm64')
+    cpusubtype = CPUSUBTYPE_ARM64E if subtype == 'arm64e' else CPUSUBTYPE_ARM64
     prog = build_program()
     raw = b''.join(struct.pack('<I', w) for w in prog.code)
     assert CODE_OFF + len(raw) <= SEG, 'code does not fit one 16K page'
@@ -328,7 +349,7 @@ def main():
         struct.pack('<4I', mkinit.LC_CODE_SIGNATURE, 16, SEG, sig_size),
     ]
     lc = b''.join(cmds)
-    header = struct.pack('<8I', mkinit.MH_MAGIC_64, mkinit.CPU_TYPE_ARM64, CPUSUBTYPE,
+    header = struct.pack('<8I', mkinit.MH_MAGIC_64, mkinit.CPU_TYPE_ARM64, cpusubtype,
                          mkinit.MH_EXECUTE, len(cmds), len(lc), mkinit.MH_NOUNDEFS, 0)
     assert 32 + len(lc) <= CODE_OFF
     image = bytearray(SEG)
@@ -340,7 +361,7 @@ def main():
     with io.open(out, 'wb') as fh:
         fh.write(blob)
     print('%s: %d bytes, %d instructions, cpusubtype %#x'
-          % (out, len(blob), len(prog.code), CPUSUBTYPE))
+          % (out, len(blob), len(prog.code), cpusubtype))
 
 
 if __name__ == '__main__':

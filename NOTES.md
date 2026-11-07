@@ -86,14 +86,50 @@ Boot-args: `sweetpac=0` disables, `sweetpaclog=1` logs each emulated class once.
 booted in QEMU, never run on the phone. There is no CI run and no log for it yet;
 NOTHING in README/site/docs was changed to say iOS 27 or iPhone 17 Pro works.
 
+**2026-11-07, later: QEMU now runs on this Windows box, and the UNPATCHED kernel 0081
+confirms both halves of the diagnosis.** (Kernel `xnu/out-0081` = patch series 0001-0081,
+i.e. *without* 0082; fixture `research/pac-test-arm64.bin` declares
+`CPU_SUBTYPE_ARM64_ALL` but contains the PAC code, so the loader accepts it and the trap
+is what gets exercised.)
+- On screen at t=31..40 s: `SWEET PAC TEST: arm64e binary running, prologue PACIBSP ok`
+  -> the HINT-space `pacibsp` prologue does not fault, userspace runs.
+- Then `qemu.log`: `Undefined Instruction ... from EL0 ... ESR 0x0 ... ELR 0x100000434`
+  = the `pacia` at instruction 13 (exactly the predicted EC=0 trap), and the kernel
+  panics `initproc failed to start - exit reason namespace 2 subcode 0x4`
+  (subcode 4 = SIGILL). So the process dies on its first `pac*`, as designed by the test.
+- Same fixture declared `CPU_SUBTYPE_ARM64E` (`research/pac-test-arm64e.bin`): no banner,
+  no user-mode exception in `qemu.log` at all -> exec never happened, i.e. `grade_binary()`
+  rejected the arm64e slice (EBADARCH). That is the loader gate 0082 opens.
+Environment now: portable `git 2.56` + `gh 2.103` (`%USERPROFILE%\git`, `%USERPROFILE%\gh`,
+logged in as `beteray`), QEMU 11.1.0 (`C:\Program Files\qemu`), Python 3.15. The phone is
+NOT usable from this PC yet: Windows has no bootloader driver for it
+(`USB\VID_18D1&PID_D00D`, Code 28) and installing one needs local admin.
+`tools/qemu-sweet.py` needed four Windows fixes (committed): QMP over TCP instead of
+`AF_UNIX`, `-display none`, forward-slash paths, and `_iso_font` read from the Mach-O
+symbol table when `llvm-nm` is missing. New `--snapshot-at T` saves+decodes the
+framebuffer mid-run, which is how the banner above was captured (a PID-1 exit panics and
+redraws the whole screen). `tools/mkpacexe.py` now pauses 10 s after the banner and 10 s
+after PASS for exactly that reason.
+
+**Why every GitHub run was cancelled in 0 s (found):** not billing - the `macos-14` runner
+image was retired on 2026-10-01 (GitHub changelog), so jobs labelled `macos-14` never get a
+runner. `.github/workflows/xnu.yml` now asks for `macos-15`. `dipa-studio/ios-sweet` is
+not ours (read-only), so the build runs in the `beteray/ios-sweet` fork, branch
+`stage0-pac` (commits `9473596`, then the workflow fix); commit to `dipa-studio` remains
+for whoever has write access there.
+
 **Next concrete steps, in order:**
-1. With `git`+`gh`: commit 0082 + `tools/mkpacexe.py` + `tools/run-pac-test.sh`
-   (trailer `Co-Authored-By: dipa-studio`), push, `gh workflow run xnu.yml -R
-   dipa-studio/ios-sweet`, then `gh run download <id> -n xnu-kernel -D xnu/out-0082`.
-2. On a Linux machine with qemu: `tools/run-pac-test.sh xnu/out-0082/kernel.development.sweet`
-   and paste the `serial.txt` markers + the `initproc exited ... exit status 0`
-   line into this file. If the kernel does not build, fix the patch (likely first
-   candidates: the `bool` TUNABLE and the `kprintf` format) and rebuild.
+1. Let the `macos-15` build of `beteray/ios-sweet@stage0-pac` finish
+   (`gh run watch <id> -R beteray/ios-sweet`), download `xnu-kernel` to `xnu/out-0082`.
+   If it fails on `iig` (`IORPC.kernelContent`), the follow-up is the `struct IORPC` in
+   `iokit/DriverKit/IORPC.h`: newer Xcode's iig emits a field this xnu lacks.
+2. Run the acceptance test locally on Windows:
+   `python tools/mkpayload.py xnu/out-0082/kernel.development.sweet research/q0082.adt
+   research/payload-0082-a64e.bin --ramdisk research/pac-test-arm64e.bin --cmdline
+   'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 sweetpaclog=1'`
+   then `python tools/qemu-sweet.py research/payload-0082-a64e.bin research/q0082-run
+   --secs 120 --kernel xnu/out-0082/kernel.development.sweet --snapshot-at 40 --snapshot-at 55`
+   and paste the PASS line + `exit status 0` panic into this file.
 3. Only then move to ETAP 1 (no iOS 27 xnu exists; the honest base is xnu-12377 =
    macOS/iOS 26 generation, and it needs a full re-derivation of 0001-0082).
 
