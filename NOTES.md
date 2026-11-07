@@ -14,8 +14,9 @@ kernel, accepted only by a QEMU run of an arm64e binary.
 - No toolchain: `git`, `gh`, `clang`/LLVM, `qemu-system-aarch64`, `adb`, `fastboot`,
   `make`, `cmake` MISSING; `wsl -l -v` = no distribution. Present: Python 3.15.2, Node,
   network. `tools/qemu-sweet.py --check-env` fails on qemu + llvm-nm.
-  -> Nothing here can compile XNU (macOS-only) or run QEMU. The user is providing the
-  tree + `git`/`gh` (chosen on 2026-11-07); until then stage 0 is **unverified**.
+  -> Nothing here can compile XNU (macOS-only). Since then (same day) portable
+  `git`/`gh` and QEMU 11.1.0 were installed on this PC and the stage-0 kernel was
+  built in the `beteray/ios-sweet` fork; see "VERIFIED IN QEMU" below.
 - Remote = local: `dipa-studio/ios-sweet` has the same 85 patches (last 0081). Last
   successful `xnu` CI run **#94, 2026-10-18T19:18Z, sha `fdad0de8`**. Runs #1-#5
   (2026-10-25/26, workflow `build-hackios-xnu`, `pull_request`, fork `zaidanfaiz`)
@@ -119,10 +120,20 @@ Boot-args: `sweetpac=0` disables, `sweetpaclog=1` logs each emulated class once.
   compared equal. (The `PASS 10/10` line itself scrolled off the framebuffer: the
   kernel keeps printing during boot and the PID-1 panic redraws the screen;
   snapshots every second could not catch it either.)
-**Still not done:** 0082 has never run on the phone. This PC has no Android
-bootloader driver for the phone (needs admin), and the shim/root image are not in
-this workspace. README/site/docs still say iOS 16 / iPhone X and must keep saying
-so until stages 1-2 land. Stage 3 identity is untouched.
+**Still not done:** 0082 has never run on the phone. The shim/root image are not in
+this workspace, and fastboot is not usable on this PC (see below). README/site/docs
+still say iOS 16 / iPhone X and must keep saying so until stages 1-2 land. Stage 3
+identity is untouched.
+**Phone / Windows USB, 2026-11-07 (attempted, with admin):** the phone is in
+fastboot and enumerates as `USB\VID_18D1&PID_D00D`. Google's `usb_driver_r13`
+installs fine for ADB (`18D1:4E11`, `18D1:4EE2&MI_01`) but its INF does not list
+`D00D`, so the bootloader interface stays Code 28. A hand-written WinUSB INF for
+`USB\VID_18D1&PID_D00D` is rejected by Windows: "Plik INF ... nie zawiera podpisu
+cyfrowego" (no digital signature). To get fastboot on this box: install a signed
+OEM driver (e.g. Mi USB Driver), use Zadig's signed-catalog WinUSB flow (GUI), or
+disable driver signature enforcement. Even then, booting needs `shim-boot.img`
+(built by `shim/build.sh` with an aarch64 cross-compiler) and the 16 GB root image,
+neither of which is here.
 **2026-11-07, later: QEMU now runs on this Windows box, and the UNPATCHED kernel 0081
 confirms both halves of the diagnosis.** (Kernel `xnu/out-0081` = patch series 0001-0081,
 i.e. *without* 0082; fixture `research/pac-test-arm64.bin` declares
