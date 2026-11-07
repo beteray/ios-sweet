@@ -2,7 +2,7 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> 2026-11-07 STAGE 0 (read first): PAC emulation written, not yet built or booted <<<
+### >>> 2026-11-07 STAGE 0: DONE - an arm64e binary runs under the SWEET kernel in QEMU and exits 0 <<<
 
 New target set by the user on 2026-11-07: iOS 27 userland + iPhone 17 Pro identity
 (`docs/RETARGET-ios27.md`, `docs/PROMPT-ios27.md`). Stage 0 = PAC emulation in the
@@ -82,10 +82,47 @@ Boot-args: `sweetpac=0` disables, `sweetpaclog=1` logs each emulated class once.
   machine-checkable proof of "exit code 0"; the runner greps for it and for the
   PASS line (`tools/run-pac-test.sh`), and treats that one panic as expected.
 
-**NOT DONE (do not claim otherwise):** patch 0082 has never been compiled, never
-booted in QEMU, never run on the phone. There is no CI run and no log for it yet;
-NOTHING in README/site/docs was changed to say iOS 27 or iPhone 17 Pro works.
-
+**VERIFIED IN QEMU 2026-11-07 (stage 0 acceptance MET):**
+- kernel: CI run `42358883230` (`beteray/ios-sweet@stage0-pac`, sha `ab88e591`,
+  `macos-15`, conclusion success) -> artifact `xnu-kernel` in
+  `xnu/out-0082/kernel.development.sweet`, 17205904 bytes, SHA256
+  `e9aa28d3a0a25a9237bc2597663907877eddeaff45179a033ebe822e256517d5`; it contains
+  the `SWEET PAC:` strings, so 0082 really is in the build.
+- QEMU 11.1.0: `-M virt,gic-version=3 -cpu cortex-a76`; payload
+  `research/payload-0082-a64e.bin` = that kernel + `research/q0082.adt`
+  (`mkadt.py --qemu`) + `research/pac-test-arm64e.bin` as the md0 root; cmdline
+  `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 sweetpaclog=1`.
+  The fixture's cpusubtype is `0x81000002` (CPU_SUBTYPE_ARM64E | ptrauth ABI v1),
+  i.e. what `clang -arch arm64e` emits, and its entry starts with PACIBSP.
+- On screen (`research/q0082-run/fb-35.txt`): the test's banner
+  `SWEET PAC TEST: arm64e binary running, prologue PACIBSP ok`, then one kernel
+  line per emulated instruction (all ten classes, with the PC each resumed at):
+  ```
+  SWEET PAC: pac/aut   instr 0xdac1012a pc 0x100000434 -> 0x100000438
+  SWEET PAC: pac/aut   instr 0xdac1052b pc 0x100000440 -> 0x100000444
+  SWEET PAC: pac/aut   instr 0xdac1092c pc 0x10000044c -> 0x100000450
+  SWEET PAC: pac/aut   instr 0xdac1118d pc 0x100000458 -> 0x10000045c
+  SWEET PAC: xpac      instr 0xdac143ed pc 0x100000464 -> 0x100000468
+  SWEET PAC: pac/aut Z instr 0xdac123ee pc 0x100000470 -> 0x100000474
+  SWEET PAC: pac/aut Z instr 0xdac133ef pc 0x10000047c -> 0x100000480
+  SWEET PAC: braa      instr 0xd71f0a00 pc 0x10000048c -> 0x100000494
+  SWEET PAC: blraa     instr 0xd63f0a3f pc 0x100000498 -> 0x1000004a0
+  SWEET PAC: retaa     instr 0xd65f0bff pc 0x1000004b0 -> 0x1000004b8
+  ```
+  (`braa -> 0x494` is the branch target, `blraa -> 0x4a0` is x30 = pc+4, the rest
+  are pc+4: the intended semantics). That run's `qemu.log` holds exactly those ten
+  EL0 `ESR EC=0` traps at those addresses and no other user fault.
+- Exit status: the final screen (`fb.txt`/`fb-45.txt`) reads
+  `panic(cpu 0 ...): initproc failed to start -- no exit reason available --
+  (signal 0, exit status 0)` -> the process ended with status **0**. Every failure
+  path in the test prints `FAIL check N` and exits 1, so 0 means all ten checks
+  compared equal. (The `PASS 10/10` line itself scrolled off the framebuffer: the
+  kernel keeps printing during boot and the PID-1 panic redraws the screen;
+  snapshots every second could not catch it either.)
+**Still not done:** 0082 has never run on the phone. This PC has no Android
+bootloader driver for the phone (needs admin), and the shim/root image are not in
+this workspace. README/site/docs still say iOS 16 / iPhone X and must keep saying
+so until stages 1-2 land. Stage 3 identity is untouched.
 **2026-11-07, later: QEMU now runs on this Windows box, and the UNPATCHED kernel 0081
 confirms both halves of the diagnosis.** (Kernel `xnu/out-0081` = patch series 0001-0081,
 i.e. *without* 0082; fixture `research/pac-test-arm64.bin` declares
